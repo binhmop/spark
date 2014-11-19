@@ -17,18 +17,27 @@
 
 package org.apache.spark.mllib.linalg
 
-import java.lang.{Iterable => JavaIterable, Integer => JavaInteger, Double => JavaDouble}
-import java.util.Arrays
+import java.util
+import java.lang.{Double => JavaDouble, Integer => JavaInteger, Iterable => JavaIterable}
 
 import scala.annotation.varargs
 import scala.collection.JavaConverters._
 
-import breeze.linalg.{Vector => BV, DenseVector => BDV, SparseVector => BSV}
+import breeze.linalg.{DenseVector => BDV, SparseVector => BSV, Vector => BV}
+
+import org.apache.spark.SparkException
+import org.apache.spark.mllib.util.NumericParser
+import org.apache.spark.sql.catalyst.annotation.SQLUserDefinedType
+import org.apache.spark.sql.catalyst.expressions.{GenericMutableRow, Row}
+import org.apache.spark.sql.catalyst.types._
 
 /**
  * Represents a numeric vector, whose index type is Int and value type is Double.
+ *
+ * Note: Users should not implement this interface.
  */
-trait Vector extends Serializable {
+@SQLUserDefinedType(udt = classOf[VectorUDT])
+sealed trait Vector extends Serializable {
 
   /**
    * Size of the vector.
@@ -43,12 +52,12 @@ trait Vector extends Serializable {
   override def equals(other: Any): Boolean = {
     other match {
       case v: Vector =>
-        Arrays.equals(this.toArray, v.toArray)
+        util.Arrays.equals(this.toArray, v.toArray)
       case _ => false
     }
   }
 
-  override def hashCode(): Int = Arrays.hashCode(this.toArray)
+  override def hashCode(): Int = util.Arrays.hashCode(this.toArray)
 
   /**
    * Converts the instance to a breeze vector.
@@ -59,7 +68,76 @@ trait Vector extends Serializable {
    * Gets the value of the ith element.
    * @param i index
    */
-  private[mllib] def apply(i: Int): Double = toBreeze(i)
+  def apply(i: Int): Double = toBreeze(i)
+
+  /**
+   * Makes a deep copy of this vector.
+   */
+  def copy: Vector = {
+    throw new NotImplementedError(s"copy is not implemented for ${this.getClass}.")
+  }
+}
+
+/**
+ * User-defined type for [[Vector]] which allows easy interaction with SQL
+ * via [[org.apache.spark.sql.SchemaRDD]].
+ */
+private[spark] class VectorUDT extends UserDefinedType[Vector] {
+
+  override def sqlType: StructType = {
+    // type: 0 = sparse, 1 = dense
+    // We only use "values" for dense vectors, and "size", "indices", and "values" for sparse
+    // vectors. The "values" field is nullable because we might want to add binary vectors later,
+    // which uses "size" and "indices", but not "values".
+    StructType(Seq(
+      StructField("type", ByteType, nullable = false),
+      StructField("size", IntegerType, nullable = true),
+      StructField("indices", ArrayType(IntegerType, containsNull = false), nullable = true),
+      StructField("values", ArrayType(DoubleType, containsNull = false), nullable = true)))
+  }
+
+  override def serialize(obj: Any): Row = {
+    val row = new GenericMutableRow(4)
+    obj match {
+      case sv: SparseVector =>
+        row.setByte(0, 0)
+        row.setInt(1, sv.size)
+        row.update(2, sv.indices.toSeq)
+        row.update(3, sv.values.toSeq)
+      case dv: DenseVector =>
+        row.setByte(0, 1)
+        row.setNullAt(1)
+        row.setNullAt(2)
+        row.update(3, dv.values.toSeq)
+    }
+    row
+  }
+
+  override def deserialize(datum: Any): Vector = {
+    datum match {
+      // TODO: something wrong with UDT serialization
+      case v: Vector =>
+        v
+      case row: Row =>
+        require(row.length == 4,
+          s"VectorUDT.deserialize given row with length ${row.length} but requires length == 4")
+        val tpe = row.getByte(0)
+        tpe match {
+          case 0 =>
+            val size = row.getInt(1)
+            val indices = row.getAs[Iterable[Int]](2).toArray
+            val values = row.getAs[Iterable[Double]](3).toArray
+            new SparseVector(size, indices, values)
+          case 1 =>
+            val values = row.getAs[Iterable[Double]](3).toArray
+            new DenseVector(values)
+        }
+    }
+  }
+
+  override def pyUDT: String = "pyspark.mllib.linalg.VectorUDT"
+
+  override def userClass: Class[Vector] = classOf[Vector]
 }
 
 /**
@@ -125,12 +203,41 @@ object Vectors {
   }
 
   /**
+   * Creates a dense vector of all zeros.
+   *
+   * @param size vector size
+   * @return a zero vector
+   */
+  def zeros(size: Int): Vector = {
+    new DenseVector(new Array[Double](size))
+  }
+
+  /**
+   * Parses a string resulted from `Vector#toString` into
+   * an [[org.apache.spark.mllib.linalg.Vector]].
+   */
+  def parse(s: String): Vector = {
+    parseNumeric(NumericParser.parse(s))
+  }
+
+  private[mllib] def parseNumeric(any: Any): Vector = {
+    any match {
+      case values: Array[Double] =>
+        Vectors.dense(values)
+      case Seq(size: Double, indices: Array[Double], values: Array[Double]) =>
+        Vectors.sparse(size.toInt, indices.map(_.toInt), values)
+      case other =>
+        throw new SparkException(s"Cannot parse $other.")
+    }
+  }
+
+  /**
    * Creates a vector instance from a breeze vector.
    */
   private[mllib] def fromBreeze(breezeVector: BV[Double]): Vector = {
     breezeVector match {
       case v: BDV[Double] =>
-        if (v.offset == 0 && v.stride == 1) {
+        if (v.offset == 0 && v.stride == 1 && v.length == v.data.length) {
           new DenseVector(v.data)
         } else {
           new DenseVector(v.toArray)  // Can't use underlying array directly, so make a new one
@@ -150,6 +257,7 @@ object Vectors {
 /**
  * A dense vector represented by a value array.
  */
+@SQLUserDefinedType(udt = classOf[VectorUDT])
 class DenseVector(val values: Array[Double]) extends Vector {
 
   override def size: Int = values.length
@@ -161,6 +269,10 @@ class DenseVector(val values: Array[Double]) extends Vector {
   private[mllib] override def toBreeze: BV[Double] = new BDV[Double](values)
 
   override def apply(i: Int) = values(i)
+
+  override def copy: DenseVector = {
+    new DenseVector(values.clone())
+  }
 }
 
 /**
@@ -170,14 +282,16 @@ class DenseVector(val values: Array[Double]) extends Vector {
  * @param indices index array, assume to be strictly increasing.
  * @param values value array, must have the same length as the index array.
  */
+@SQLUserDefinedType(udt = classOf[VectorUDT])
 class SparseVector(
     override val size: Int,
     val indices: Array[Int],
     val values: Array[Double]) extends Vector {
 
-  override def toString: String = {
-    "(" + size + "," + indices.zip(values).mkString("[", "," ,"]") + ")"
-  }
+  require(indices.length == values.length)
+
+  override def toString: String =
+    "(%s,%s,%s)".format(size, indices.mkString("[", ",", "]"), values.mkString("[", ",", "]"))
 
   override def toArray: Array[Double] = {
     val data = new Array[Double](size)
@@ -188,6 +302,10 @@ class SparseVector(
       i += 1
     }
     data
+  }
+
+  override def copy: SparseVector = {
+    new SparseVector(size, indices.clone(), values.clone())
   }
 
   private[mllib] override def toBreeze: BV[Double] = new BSV[Double](indices, values, size)

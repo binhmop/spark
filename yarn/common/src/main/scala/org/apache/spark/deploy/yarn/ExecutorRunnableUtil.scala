@@ -17,7 +17,6 @@
 
 package org.apache.spark.deploy.yarn
 
-import java.io.File
 import java.net.URI
 
 import scala.collection.JavaConversions._
@@ -28,9 +27,10 @@ import org.apache.hadoop.yarn.api._
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment
 import org.apache.hadoop.yarn.api.records._
 import org.apache.hadoop.yarn.conf.YarnConfiguration
-import org.apache.hadoop.yarn.util.{Apps, ConverterUtils, Records}
+import org.apache.hadoop.yarn.util.{ConverterUtils, Records}
 
 import org.apache.spark.{Logging, SparkConf}
+import org.apache.spark.util.Utils
 
 trait ExecutorRunnableUtil extends Logging {
 
@@ -44,21 +44,32 @@ trait ExecutorRunnableUtil extends Logging {
       hostname: String,
       executorMemory: Int,
       executorCores: Int,
+      appId: String,
       localResources: HashMap[String, LocalResource]): List[String] = {
     // Extra options for the JVM
-    val JAVA_OPTS = ListBuffer[String]()
+    val javaOpts = ListBuffer[String]()
+
+    // Set the environment variable through a command prefix
+    // to append to the existing value of the variable
+    var prefixEnv: Option[String] = None
+
     // Set the JVM memory
     val executorMemoryString = executorMemory + "m"
-    JAVA_OPTS += "-Xms" + executorMemoryString + " -Xmx" + executorMemoryString + " "
+    javaOpts += "-Xms" + executorMemoryString + " -Xmx" + executorMemoryString + " "
 
     // Set extra Java options for the executor, if defined
     sys.props.get("spark.executor.extraJavaOptions").foreach { opts =>
-      JAVA_OPTS += opts
+      javaOpts += opts
+    }
+    sys.env.get("SPARK_JAVA_OPTS").foreach { opts =>
+      javaOpts += opts
+    }
+    sys.props.get("spark.executor.extraLibraryPath").foreach { p =>
+      prefixEnv = Some(Utils.libraryPathEnvPrefix(Seq(p)))
     }
 
-    JAVA_OPTS += "-Djava.io.tmpdir=" +
+    javaOpts += "-Djava.io.tmpdir=" +
       new Path(Environment.PWD.$(), YarnConfiguration.DEFAULT_CONTAINER_TEMP_DIR)
-    JAVA_OPTS += ClientBase.getLog4jConfiguration(localResources)
 
     // Certain configs need to be passed here because they are needed before the Executor
     // registers with the Scheduler and transfers the spark configs. Since the Executor backend
@@ -66,10 +77,10 @@ trait ExecutorRunnableUtil extends Logging {
     // authentication settings.
     sparkConf.getAll.
       filter { case (k, v) => k.startsWith("spark.auth") || k.startsWith("spark.akka") }.
-      foreach { case (k, v) => JAVA_OPTS += "-D" + k + "=" + "\\\"" + v + "\\\"" }
+      foreach { case (k, v) => javaOpts += YarnSparkHadoopUtil.escapeForShell(s"-D$k=$v") }
 
     sparkConf.getAkkaConf.
-      foreach { case (k, v) => JAVA_OPTS += "-D" + k + "=" + "\\\"" + v + "\\\"" }
+      foreach { case (k, v) => javaOpts += YarnSparkHadoopUtil.escapeForShell(s"-D$k=$v") }
 
     // Commenting it out for now - so that people can refer to the properties if required. Remove
     // it once cpuset version is pushed out.
@@ -88,15 +99,18 @@ trait ExecutorRunnableUtil extends Logging {
           // multi-tennent machines
           // The options are based on
           // http://www.oracle.com/technetwork/java/gc-tuning-5-138395.html#0.0.0.%20When%20to%20Use%20the%20Concurrent%20Low%20Pause%20Collector|outline
-          JAVA_OPTS += " -XX:+UseConcMarkSweepGC "
-          JAVA_OPTS += " -XX:+CMSIncrementalMode "
-          JAVA_OPTS += " -XX:+CMSIncrementalPacing "
-          JAVA_OPTS += " -XX:CMSIncrementalDutyCycleMin=0 "
-          JAVA_OPTS += " -XX:CMSIncrementalDutyCycle=10 "
+          javaOpts += " -XX:+UseConcMarkSweepGC "
+          javaOpts += " -XX:+CMSIncrementalMode "
+          javaOpts += " -XX:+CMSIncrementalPacing "
+          javaOpts += " -XX:CMSIncrementalDutyCycleMin=0 "
+          javaOpts += " -XX:CMSIncrementalDutyCycle=10 "
         }
     */
 
-    val commands = Seq(Environment.JAVA_HOME.$() + "/bin/java",
+    // For log4j configuration to reference
+    javaOpts += ("-Dspark.yarn.app.container.log.dir=" + ApplicationConstants.LOG_DIR_EXPANSION_VAR)
+
+    val commands = prefixEnv ++ Seq(Environment.JAVA_HOME.$() + "/bin/java",
       "-server",
       // Kill if OOM is raised - leverage yarn's failure handling to cause rescheduling.
       // Not killing the task leaves various aspects of the executor and (to some extent) the jvm in
@@ -104,12 +118,13 @@ trait ExecutorRunnableUtil extends Logging {
       // TODO: If the OOM is not recoverable by rescheduling it on different node, then do
       // 'something' to fail job ... akin to blacklisting trackers in mapred ?
       "-XX:OnOutOfMemoryError='kill %p'") ++
-      JAVA_OPTS ++
+      javaOpts ++
       Seq("org.apache.spark.executor.CoarseGrainedExecutorBackend",
       masterAddress.toString,
       slaveId.toString,
       hostname.toString,
       executorCores.toString,
+      appId,
       "1>", ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout",
       "2>", ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr")
 
@@ -123,9 +138,9 @@ trait ExecutorRunnableUtil extends Logging {
       localResources: HashMap[String, LocalResource],
       timestamp: String,
       size: String,
-      vis: String) = {
+      vis: String): Unit = {
     val uri = new URI(file)
-    val amJarRsrc = Records.newRecord(classOf[LocalResource]).asInstanceOf[LocalResource]
+    val amJarRsrc = Records.newRecord(classOf[LocalResource])
     amJarRsrc.setType(rtype)
     amJarRsrc.setVisibility(LocalResourceVisibility.valueOf(vis))
     amJarRsrc.setResource(ConverterUtils.getYarnUrlFromURI(uri))
@@ -166,19 +181,21 @@ trait ExecutorRunnableUtil extends Logging {
 
   def prepareEnvironment: HashMap[String, String] = {
     val env = new HashMap[String, String]()
-
     val extraCp = sparkConf.getOption("spark.executor.extraClassPath")
-    val log4jConf = System.getenv(ClientBase.LOG4J_CONF_ENV_KEY)
-    ClientBase.populateClasspath(yarnConf, sparkConf, log4jConf, env, extraCp)
-    if (log4jConf != null) {
-      env(ClientBase.LOG4J_CONF_ENV_KEY) = log4jConf
+    ClientBase.populateClasspath(null, yarnConf, sparkConf, env, extraCp)
+
+    sparkConf.getExecutorEnv.foreach { case (key, value) =>
+      // This assumes each executor environment variable set here is a path
+      // This is kept for backward compatibility and consistency with hadoop
+      YarnSparkHadoopUtil.addPathToEnvironment(env, key, value)
     }
 
-    // Allow users to specify some environment variables
-    YarnSparkHadoopUtil.setEnvFromInputString(env, System.getenv("SPARK_YARN_USER_ENV"),
-      File.pathSeparator)
+    // Keep this for backwards compatibility but users should move to the config
+    sys.env.get("SPARK_YARN_USER_ENV").foreach { userEnvs =>
+      YarnSparkHadoopUtil.setEnvFromInputString(env, userEnvs)
+    }
 
-    System.getenv().filterKeys(_.startsWith("SPARK")).foreach { case (k,v) => env(k) = v }
+    System.getenv().filterKeys(_.startsWith("SPARK")).foreach { case (k, v) => env(k) = v }
     env
   }
 
